@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/igolaizola/vidai/pkg/runway"
+	"github.com/m00nsp3ll/vidai/pkg/runway"
 )
 
 type Config struct {

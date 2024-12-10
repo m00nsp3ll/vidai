@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/igolaizola/vidai/pkg/cmd/extend"
-	"github.com/igolaizola/vidai/pkg/cmd/generate"
-	"github.com/igolaizola/vidai/pkg/cmd/loop"
+	"github.com/m00nsp3ll/vidai/pkg/cmd/extend"
+	"github.com/m00nsp3ll/vidai/pkg/cmd/generate"
+	"github.com/m00nsp3ll/vidai/pkg/cmd/loop"
 	"github.com/peterbourgon/ff/v3"
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"github.com/peterbourgon/ff/v3/ffyaml"
