@@ -1,5 +1,5 @@
 module github.com/m00nsp3ll/vidai
-replace github.com/igolaizola/vidai => github.com/m00nsp3ll/vidai v0.0.0-20241016214609-103ae28e41ca
+
 
 
 go 1.21
