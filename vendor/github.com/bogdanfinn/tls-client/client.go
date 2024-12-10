@@ -10,10 +10,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bogdanfinn/tls-client/profiles"
-
 	http "github.com/bogdanfinn/fhttp"
 	"github.com/bogdanfinn/fhttp/httputil"
+	"github.com/bogdanfinn/tls-client/bandwidth"
+	"github.com/bogdanfinn/tls-client/profiles"
 	"golang.org/x/net/proxy"
 )
 
@@ -35,16 +35,21 @@ type HttpClient interface {
 	Get(url string) (resp *http.Response, err error)
 	Head(url string) (resp *http.Response, err error)
 	Post(url, contentType string, body io.Reader) (resp *http.Response, err error)
+
+	GetBandwidthTracker() bandwidth.BandwidthTracker
 }
 
 // Interface guards are a cheap way to make sure all methods are implemented, this is a static check and does not affect runtime performance.
 var _ HttpClient = (*httpClient)(nil)
 
 type httpClient struct {
+	logger Logger
+
+	bandwidthTracker bandwidth.BandwidthTracker
+	config           *httpClientConfig
+
 	http.Client
 	headerLck sync.Mutex
-	logger    Logger
-	config    *httpClientConfig
 }
 
 var DefaultTimeoutSeconds = 30
@@ -69,6 +74,7 @@ func NewHttpClient(logger Logger, options ...HttpClientOption) (HttpClient, erro
 		badPinHandler:      nil,
 		customRedirectFunc: nil,
 		defaultHeaders:     make(http.Header),
+		connectHeaders:     make(http.Header),
 		clientProfile:      profiles.DefaultClientProfile,
 		timeout:            time.Duration(DefaultTimeoutSeconds) * time.Second,
 	}
@@ -81,7 +87,7 @@ func NewHttpClient(logger Logger, options ...HttpClientOption) (HttpClient, erro
 		return nil, err
 	}
 
-	client, clientProfile, err := buildFromConfig(logger, config)
+	client, bandwidthTracker, clientProfile, err := buildFromConfig(logger, config)
 	if err != nil {
 		return nil, err
 	}
@@ -101,10 +107,11 @@ func NewHttpClient(logger Logger, options ...HttpClientOption) (HttpClient, erro
 	}
 
 	return &httpClient{
-		Client:    *client,
-		logger:    logger,
-		config:    config,
-		headerLck: sync.Mutex{},
+		Client:           *client,
+		logger:           logger,
+		config:           config,
+		headerLck:        sync.Mutex{},
+		bandwidthTracker: bandwidthTracker,
 	}, nil
 }
 
@@ -112,14 +119,14 @@ func validateConfig(_ *httpClientConfig) error {
 	return nil
 }
 
-func buildFromConfig(logger Logger, config *httpClientConfig) (*http.Client, profiles.ClientProfile, error) {
+func buildFromConfig(logger Logger, config *httpClientConfig) (*http.Client, bandwidth.BandwidthTracker, profiles.ClientProfile, error) {
 	var dialer proxy.ContextDialer
 	dialer = newDirectDialer(config.timeout, config.localAddr, config.dialer)
 
 	if config.proxyUrl != "" {
-		proxyDialer, err := newConnectDialer(config.proxyUrl, config.timeout, config.localAddr, config.dialer, logger)
+		proxyDialer, err := newConnectDialer(config.proxyUrl, config.timeout, config.localAddr, config.dialer, config.connectHeaders, logger)
 		if err != nil {
-			return nil, profiles.ClientProfile{}, err
+			return nil, nil, profiles.ClientProfile{}, err
 		}
 
 		dialer = proxyDialer
@@ -136,11 +143,18 @@ func buildFromConfig(logger Logger, config *httpClientConfig) (*http.Client, pro
 		}
 	}
 
+	var bandwidthTracker bandwidth.BandwidthTracker
+	if config.enabledBandwidthTracker {
+		bandwidthTracker = bandwidth.NewTracker()
+	} else {
+		bandwidthTracker = bandwidth.NewNopeTracker()
+	}
+
 	clientProfile := config.clientProfile
 
-	transport, err := newRoundTripper(clientProfile, config.transportOptions, config.serverNameOverwrite, config.insecureSkipVerify, config.withRandomTlsExtensionOrder, config.forceHttp1, config.certificatePins, config.badPinHandler, config.disableIPV6, dialer)
+	transport, err := newRoundTripper(clientProfile, config.transportOptions, config.serverNameOverwrite, config.insecureSkipVerify, config.withRandomTlsExtensionOrder, config.forceHttp1, config.certificatePins, config.badPinHandler, config.disableIPV6, config.disableIPV4, bandwidthTracker, dialer)
 	if err != nil {
-		return nil, clientProfile, err
+		return nil, nil, clientProfile, err
 	}
 
 	client := &http.Client{
@@ -153,7 +167,7 @@ func buildFromConfig(logger Logger, config *httpClientConfig) (*http.Client, pro
 		client.Jar = config.cookieJar
 	}
 
-	return client, clientProfile, nil
+	return client, bandwidthTracker, clientProfile, nil
 }
 
 // CloseIdleConnections closes all idle connections of the underlying http client.
@@ -221,7 +235,7 @@ func (c *httpClient) applyProxy() error {
 
 	if c.config.proxyUrl != "" {
 		c.logger.Debug("proxy url %s supplied - using proxy connect dialer", c.config.proxyUrl)
-		proxyDialer, err := newConnectDialer(c.config.proxyUrl, c.config.timeout, c.config.localAddr, c.config.dialer, c.logger)
+		proxyDialer, err := newConnectDialer(c.config.proxyUrl, c.config.timeout, c.config.localAddr, c.config.dialer, c.config.connectHeaders, c.logger)
 		if err != nil {
 			c.logger.Error("failed to create proxy connect dialer: %s", err.Error())
 			return err
@@ -230,7 +244,7 @@ func (c *httpClient) applyProxy() error {
 		dialer = proxyDialer
 	}
 
-	transport, err := newRoundTripper(c.config.clientProfile, c.config.transportOptions, c.config.serverNameOverwrite, c.config.insecureSkipVerify, c.config.withRandomTlsExtensionOrder, c.config.forceHttp1, c.config.certificatePins, c.config.badPinHandler, c.config.disableIPV6, dialer)
+	transport, err := newRoundTripper(c.config.clientProfile, c.config.transportOptions, c.config.serverNameOverwrite, c.config.insecureSkipVerify, c.config.withRandomTlsExtensionOrder, c.config.forceHttp1, c.config.certificatePins, c.config.badPinHandler, c.config.disableIPV6, c.config.disableIPV4, c.bandwidthTracker, dialer)
 	if err != nil {
 		return err
 	}
@@ -271,6 +285,11 @@ func (c *httpClient) SetCookieJar(jar http.CookieJar) {
 // GetCookieJar returns the jar the client is currently using
 func (c *httpClient) GetCookieJar() http.CookieJar {
 	return c.Jar
+}
+
+// GetBandwidthTracker returns the bandwidth tracker
+func (c *httpClient) GetBandwidthTracker() bandwidth.BandwidthTracker {
+	return c.bandwidthTracker
 }
 
 // Do issues a given HTTP request and returns the corresponding response.
